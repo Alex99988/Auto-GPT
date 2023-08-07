@@ -1,6 +1,36 @@
 import argparse
 import logging
+function q = computweight(particle, z_RD, R_Resolution, V_Resolution, Xx, Yy, delta_v,Nr,Nd)
+q = 1
+p = 1
+% particle是粒子的状态，包含了距离和速度两个部分
+range_particle = particle(1);
+velocity_particle = particle(2);
 
+% 根据粒子的状态，计算对应的距离和速度区间的索引
+range_index = ceil((range_particle - min(Xx)) / R_Resolution);
+velocity_index = ceil((velocity_particle - min(Yy)) / V_Resolution);
+% 从z_RD中提取出与粒子状态对应的雷达测量值
+
+% 检查索引是否有效，如果不在有效的范围内，则给粒子一个最小的权重
+if range_index < 1 || range_index > length(Xx) || velocity_index < 1 || velocity_index > length(Yy)
+    q = 1e-6; % 无效索引对应的最小权重
+    return;
+end
+measurement = z_RD(range_index, velocity_index);
+for ii=max(1,range_index-p):min(Nr,range_index+p)
+    for jj=max(1,velocity_index-p):min(Nd,velocity_index+p)
+        % 根据高斯噪声模型计算距离的似然性
+        R_likelihood = exp(-((ii+214)*R_Resolution - range_particle)^2 / (2*delta_v^2)) / sqrt(2*pi*delta_v^2);
+        % 计算速度的似然性
+        V_likelihood = exp(-((jj-19)*V_Resolution - velocity_particle)^2 / (2*delta_v^2)) / sqrt(2*pi*delta_v^2);
+        h = R_likelihood * V_likelihood;
+        % h_rdb_p=Amp^2*exp(-Lr*(r(ii)-zp(1))^2/Dr-Ld*(d(jj)-zp(2))^2/Dd-Lb*(b(mm)-zp(3))^2/Db)+2*delta_n^2;
+        q=q*(2*delta_v^2/h)*exp((0.5/delta_v^2-1/h)*abs(measurement)^2);
+    end
+end
+
+end
 from autogpt.commands.file_operations import ingest_file, search_files
 from autogpt.config import Config
 from autogpt.memory import get_memory
