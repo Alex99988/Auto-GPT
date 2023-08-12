@@ -1,3 +1,228 @@
+clc;
+clear;
+load RDM.mat;
+% 添加噪声
+noise = complex(randn(size(RDM)), randn(size(RDM)));
+RDM = 1.5*noise+RDM;
+R_Trx = 0;
+R_rangeMin = 520+R_Trx;
+R_rangeMax = 580+R_Trx;
+R_Resolution = 2.44;
+R_binMin = floor(R_rangeMin/R_Resolution)+1;
+R_binMax = floor(R_rangeMax/R_Resolution)+1;
+Nr = R_binMax - R_binMin;
+RbinRange = R_binMin:R_binMax;
+Xx = (RbinRange-1)*R_Resolution-R_Trx;   %meter
+
+PRI          = 2.5e-3;   %雷达脉冲重复间隔
+fc           = 3.7e9;
+frame_length     =128;   %转换后的帧长
+v_range  = -19:20;
+V_Resolution = 3e8/fc/PRI/frame_length*3.6;
+V_rangeMin = v_range(1);
+V_rangeMax = v_range(end);
+V_binMin = floor(V_rangeMin/V_Resolution) + frame_length/2;
+V_binMax = floor(V_rangeMax/V_Resolution) + frame_length/2;
+Nd = V_binMax - V_binMin;
+VbinRange = V_binMin:V_binMax;
+Yy = (VbinRange-1-frame_length/2)*V_Resolution;    %kmph
+
+
+%% parameters initialization
+steps = 50;
+x = zeros(2,steps); %状态
+z = zeros(2,steps); %测量
+T = 0.16/3.6;
+F_cv=[1 -T ; % transition matrix of cv model
+    0 1];
+G=[T^2/2 0; % process noise transition matrix, assuming the noise distribution is the same for x and y axis
+    T 0];
+delta_v=0.01; %process noise standard deviation here, equal to 0;
+delta_n = 0.5; % cov(z_RD(1000:4000,:))
+Qv=G*delta_v^2*G';% process noise covariance
+h_RD = zeros(Nr,Nd,steps); % signal contribution to the cell
+z_rdb_I=zeros(Nr,Nd,steps); % real part of z (complex amplitude)
+z_rdb_Q=zeros(Nr,Nd,steps); % imaginary part of z
+z_RD = RDM(RbinRange,VbinRange,1:steps); % ROI量测值
+% z_noise = RDM(1000:1024,20:62,1:steps);
+% singal_power = abs(z_RD).^2;
+% average_signal_power = mean(signal_power, [1, 2]);
+% noise_power = abs(z_noise).^2;
+% average_noise_power = mean(noise_power, [1, 2]);
+% snr_per_frame = 10 * log10(average_signal_power ./ average_noise_power);
+
+fai=0;
+N=5000; % number of particles
+xp=zeros(2,steps,N); % state particle
+zp=zeros(2,steps,N); % range,doppler,bearing particl
+xe=zeros(2,steps); % state estimate
+axe=zeros(2,steps);
+Pb=zeros(1,steps); % existing probability
+E=zeros(steps,N); % existing variable
+q=ones(steps,N); % weight
+EE=[0.9 0.1 % E11,E10,E01,E00
+    0.1 0.9];
+delta_v_p=3.5;
+
+% particles initialization
+for i = 1:N
+    xp(1,1,i)=R_rangeMin+(R_rangeMax-R_rangeMin)*rand;
+    xp(2,1,i)=V_rangeMin+(V_rangeMax-V_rangeMin)*rand;
+    q(1,i) = 1/N;
+    if rand<0.1
+        E(1,i)=1;
+    else
+        E(1,i)=0;
+    end
+    xe(:,1)=xe(:,1)+E(1,i)*xp(:,1,i); % initial estimation
+    %     axe(:,1)=axe(:,1)+E(1,i)*xp(:,1,i);
+    Pb(1,1)=Pb(1,1)+E(1,i); % initial probability
+end
+Pb(1,1)=Pb(1,1)/N;
+axp=xp;
+%% iteration starts
+steps_temp=steps; %迭代开始
+for k = 1 : steps_temp - 1;
+    for i = 1:N
+        if E(k,i)==0
+            if rand<0.1
+                E(k+1,i)=1;
+            else
+                E(k+1,i)=0;
+            end
+        else
+            if rand<0.1
+                E(k+1,i)=0;
+            else
+                E(k+1,i)=1;
+            end
+        end
+        if E(k,i)==1&&E(k+1,i)==1   % paricle maintain
+            axp(:,k+1,i)=F_cv*axp(:,k,i)+G*delta_v_p*randn(2,1);
+        elseif E(k,i)==0&&E(k+1,i)==1 % new particle, note: we can choose a better zone for new particles
+            axp(1,k+1,i)=R_rangeMin+(R_rangeMax-R_rangeMin)*rand;
+            axp(2,k+1,i)=V_rangeMin+(V_rangeMax-V_rangeMin)*rand;
+        elseif E(k+1,i)==0
+            axp(:,k+1,i)=0;
+        end
+        xp(:,k+1,i)=axp(:,k+1,i);
+        % q(k+1,i) = 1/N; % TODO compute weights
+        q(k+1,i) = computweight(axp(:,k+1,i), z_RD(:,:,k+1), R_Resolution, V_Resolution, Xx, Yy, delta_n,Nr,Nd);
+        %         q1(k+1,i) = computweight(axp(:,k+1,i), z_RD(:,:,k+1), R_Resolution, V_Resolution, Xx, Yy, delta_n,Nr,Nd);
+        % q1(k+1,i) = computweight(axp(:,k+1,i), z_RD(:,:,k+1), R_Resolution, V_Resolution, Xx, Yy, 0.1, delta_v);
+    end
+    %权重归一化
+    qsum = sum(q(k+1,:));
+    q(k+1,:) = q(k+1,:)/qsum;
+
+
+    % resample
+    xp_temp=xp;
+    axp_temp=axp;
+    EE_temp=E(k+1,:);
+    for i=1:N
+        uu=rand;
+        qq_sum=0;
+        for j=1:N
+            qq_sum=qq_sum+q(k+1,j);
+            if qq_sum>=uu
+                xp(:,k+1,i)=xp_temp(:,k+1,j);
+                axp(:,k+1,i)=axp_temp(:,k+1,j);
+                E(k+1,i)=EE_temp(j);
+                break;
+            end
+        end
+    end
+    for i=1:N
+        Pb(1,k+1)=Pb(1,k+1)+E(k+1,i);
+        %          xe(:,k+1)=xe(:,k+1)+E(k+1,i)*xp(:,k+1,i);
+        axe(:,k+1)=axe(:,k+1)+E(k+1,i)*axp(:,k+1,i);
+    end
+    if Pb(1,k+1)~=0;
+        %        xe(:,k+1)=xe(:,k+1)/Pb(1,k+1);
+        axe(:,k+1)=axe(:,k+1)/Pb(1,k+1);%估计状态
+    end
+
+    Pb(1,k+1)=Pb(1,k+1)/N;
+end % pf迭代结束
+
+% 记录目标出现概率与位置
+PT=zeros(1,steps);
+tt=0;
+for k=1:steps
+    if Pb(k)>0.6;
+        PT(k)=1;
+        tt=tt+1;
+        Fxe(:,tt)=axe(:,k);
+    end
+end
+
+%% Pb画图
+figure(1);
+plot(1:steps_temp,Pb(1:steps_temp),'ro-');
+title('Probability');
+xlabel('frame'); ylabel('Probability');
+%% PF画图
+figure(2);
+for i = 1:steps
+    clf
+    plot(squeeze(axp(2,i,:)),squeeze(axp(1,i,:)), 'b.','markersize',15);
+    filename = ['PF-TBD.gif'];
+    ylim([520 580]);
+    xlim([-20 20]);
+    xlabel('V(km/h)'); ylabel('R(meter)');
+    pause(0.2);
+    frame=getframe(gcf);
+    im=frame2im(frame);
+    [imind,cm]=rgb2ind(im,256);
+    if i==1
+        imwrite(imind,cm, filename,'gif','LoopCount',Inf,'DelayTime',0.1);
+    else
+        imwrite(imind,cm, filename,'gif','WriteMode','append','DelayTime',0.1);
+    end
+
+    %     saveas(gcf,['particles_' num2str(i,'%-4d') '.fig']);
+end
+%% Xe画图
+figure(4);
+plot(axe(1,2:end),'bo-');
+title('Xe');
+xlabel('frame'); ylabel('R(meter)');
+%% Xe画图
+figure(5);
+plot(axe(2,2:end),'bo-');
+title('V');
+xlabel('frame'); ylabel('V(m/s)');
+
+%% Range-Doppler动图展示
+figure(3);
+for i = 1:50;
+    clf
+    filename = ['RV.gif'];
+    RD = RDM(:,:,i);
+
+    RV_data_dB = 10*log10(squeeze(abs(RD(RbinRange,VbinRange)).^2));
+
+
+    RV_data_dB1 = 10*log10(squeeze(abs(RD(RbinRange+200,VbinRange-20)).^2));
+    surf(Yy, Xx, RV_data_dB);
+    SNR = 10*log10(max(max(abs(RD(RbinRange,VbinRange))))/mean(mean(abs(RD(RbinRange+200,VbinRange-20)))));
+
+    % shading interp;
+    colorbar;colormap(jet); view(0,90);
+    xlabel('V(km/h)'); ylabel('R(meter)');
+    caxis([-30 20]);
+    pause(0.2)
+    frame=getframe(gcf);
+    im=frame2im(frame);
+    [imind,cm]=rgb2ind(im,256);
+    if i==1
+        imwrite(imind,cm, filename,'gif','LoopCount',Inf,'DelayTime',0.1);
+    else
+        imwrite(imind,cm, filename,'gif','WriteMode','append','DelayTime',0.1);
+    end
+end
+
 import argparse
 import logging
 function q = computweight(particle, z_RD, R_Resolution, V_Resolution, Xx, Yy, delta_n,Nr,Nd)
